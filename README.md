@@ -7,8 +7,8 @@
 ## Features (MVP)
 
 - Sessions: scan `CODEX_HOME/sessions/**/rollout-*.jsonl`
-- Export: create a portable `bundle.zip` (with `manifest.json` + `rollout.jsonl`)
-- Import: validate sha256/size + conflict strategy (recommended: import as new when different sha256)
+- Export: create a portable `bundle.zip` (with `manifest.json` + `rollout.jsonl`), 默认导出到系统 Downloads；支持“合并为一个 zip”或“每会话单独 zip”
+- Import: 支持多选 zip 导入；支持导入“合并导出包”（外层 zip 内含 `bundles/*.zip`）；校验 sha256/size + 冲突策略（recommended: 有冲突则改ID导入）
 - History: vault + SQLite records, manual delete
 - Restore: restore any history version back to `CODEX_HOME` (also recorded)
 - Change ID: rewrite `session_meta.payload.id` (does not touch `forked_from_id`)

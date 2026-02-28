@@ -100,6 +100,39 @@ export type ExportResult = {
   resume_cmd: string;
 };
 
+export type ExportBundleMode = "merged" | "per_session";
+
+export type ExportSessionsParams = {
+  session_ids: string[];
+  name: string;
+  note?: string | null;
+  include_shell_snapshot: boolean;
+  mode: ExportBundleMode;
+};
+
+export type ExportSessionItem = {
+  session_id: string;
+  transfer_id: string;
+  vault_dir: string;
+  vault_bundle_path: string;
+  exported_bundle_path?: string | null;
+  manifest: BundleManifest;
+  resume_cmd: string;
+};
+
+export type ExportSessionError = {
+  session_id: string;
+  message: string;
+};
+
+export type ExportSessionsResult = {
+  mode: ExportBundleMode;
+  export_dir: string;
+  merged_bundle_path?: string | null;
+  items: ExportSessionItem[];
+  errors: ExportSessionError[];
+};
+
 export type ConflictStrategy =
   | "recommended"
   | "overwrite"
@@ -120,6 +153,31 @@ export type ImportResult = {
   local_rollout_path?: string | null;
   resume_cmd?: string | null;
   status: "ok" | "canceled" | string;
+};
+
+export type ImportBundlesParams = {
+  bundle_paths: string[];
+  name: string;
+  note?: string | null;
+  strategy: ConflictStrategy;
+};
+
+export type ImportBundlesItem = {
+  source: string;
+  result: ImportResult;
+};
+
+export type ImportBundlesError = {
+  source: string;
+  message: string;
+};
+
+export type ImportBundlesResult = {
+  requested_paths: number;
+  imported: number;
+  failed: number;
+  items: ImportBundlesItem[];
+  errors: ImportBundlesError[];
 };
 
 export type ChangeIdParams = {

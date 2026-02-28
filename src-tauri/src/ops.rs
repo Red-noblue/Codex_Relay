@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
 };
 
 use crate::{
+    app_paths,
     bundle::{
         self, BundleManifest, ManifestCodexInfo, ManifestDeviceInfo, ManifestFileInfo,
         BUNDLE_SCHEMA_VERSION,
@@ -32,6 +33,48 @@ pub struct ExportResult {
     pub vault_dir: String,
     pub manifest: BundleManifest,
     pub resume_cmd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportBundleMode {
+    Merged,
+    PerSession,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportSessionsParams {
+    pub session_ids: Vec<String>,
+    pub name: String,
+    pub note: Option<String>,
+    pub include_shell_snapshot: bool,
+    pub mode: ExportBundleMode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportSessionItem {
+    pub session_id: String,
+    pub transfer_id: String,
+    pub vault_dir: String,
+    pub vault_bundle_path: String,
+    pub exported_bundle_path: Option<String>,
+    pub manifest: BundleManifest,
+    pub resume_cmd: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportSessionError {
+    pub session_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportSessionsResult {
+    pub mode: ExportBundleMode,
+    pub export_dir: String,
+    pub merged_bundle_path: Option<String>,
+    pub items: Vec<ExportSessionItem>,
+    pub errors: Vec<ExportSessionError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +132,35 @@ pub struct ImportResult {
     pub local_rollout_path: Option<String>,
     pub resume_cmd: Option<String>,
     pub status: String, // ok | canceled
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportBundlesParams {
+    pub bundle_paths: Vec<String>,
+    pub name: String,
+    pub note: Option<String>,
+    pub strategy: ConflictStrategy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBundlesItem {
+    pub source: String,
+    pub result: ImportResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBundlesError {
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBundlesResult {
+    pub requested_paths: usize,
+    pub imported: usize,
+    pub failed: usize,
+    pub items: Vec<ImportBundlesItem>,
+    pub errors: Vec<ImportBundlesError>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -240,6 +312,172 @@ pub fn export_session<R: tauri::Runtime>(
             manifest,
             resume_cmd: format!("codex resume {}", params.session_id),
         })
+    })
+}
+
+pub fn export_sessions<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    params: ExportSessionsParams,
+) -> AppResult<ExportSessionsResult> {
+    if params.name.trim().is_empty() {
+        return Err(AppError::validation("名称为必填项")
+            .with_hint("请填写一个便于识别的名称，例如：mac -> win 传递"));
+    }
+    if params.session_ids.is_empty() {
+        return Err(AppError::validation("请至少提供 1 个会话ID")
+            .with_hint("请在“会话列表”勾选或粘贴 UUID 会话ID。"));
+    }
+
+    // Dedupe while preserving order.
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut ids: Vec<String> = Vec::new();
+    for raw in &params.session_ids {
+        let sid = raw.trim();
+        if sid.is_empty() {
+            continue;
+        }
+        if seen.insert(sid.to_string()) {
+            ids.push(sid.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::validation("会话ID为空")
+            .with_hint("请粘贴或输入至少一个 UUID 会话ID。"));
+    }
+
+    let export_dir = app_paths::download_dir().map_err(AppError::from)?;
+    fs::create_dir_all(&export_dir)
+        .map_err(|e| AppError::io(format!("create export dir: {e}")))?;
+
+    let mut items: Vec<ExportSessionItem> = Vec::new();
+    let mut errors: Vec<ExportSessionError> = Vec::new();
+
+    for sid in &ids {
+        let name = if ids.len() == 1 {
+            params.name.clone()
+        } else {
+            format!("{} [{}]", params.name, &sid.chars().take(8).collect::<String>())
+        };
+        match export_session(
+            app,
+            ExportParams {
+                session_id: sid.clone(),
+                name,
+                note: params.note.clone(),
+                include_shell_snapshot: params.include_shell_snapshot,
+            },
+        ) {
+            Ok(r) => items.push(ExportSessionItem {
+                session_id: sid.clone(),
+                transfer_id: r.transfer_id,
+                vault_dir: r.vault_dir,
+                vault_bundle_path: r.bundle_path,
+                exported_bundle_path: None,
+                manifest: r.manifest,
+                resume_cmd: r.resume_cmd,
+            }),
+            Err(e) => errors.push(ExportSessionError {
+                session_id: sid.clone(),
+                message: format!("{}{}", e.message, e.hint.map(|h| format!("（{}）", h)).unwrap_or_default()),
+            }),
+        }
+    }
+
+    // If everything failed, surface a single error for UX.
+    if items.is_empty() {
+        let msg = if errors.len() == 1 {
+            errors[0].message.clone()
+        } else {
+            format!("全部导出失败：{}/{}", errors.len(), ids.len())
+        };
+        return Err(AppError::new("EXPORT_FAILED", msg));
+    }
+
+    // Export bundle(s) to user's download dir for convenient sharing.
+    let mut merged_bundle_path: Option<String> = None;
+
+    match params.mode {
+        ExportBundleMode::PerSession => {
+            for item in &mut items {
+                let src = PathBuf::from(&item.vault_bundle_path);
+                let file_name = src
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("bundle.zip");
+                let dst = copy_to_dir_unique(&src, &export_dir, file_name)?;
+                item.exported_bundle_path = Some(dst.to_string_lossy().to_string());
+            }
+        }
+        ExportBundleMode::Merged => {
+            if items.len() == 1 {
+                let src = PathBuf::from(&items[0].vault_bundle_path);
+                let file_name = src
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("bundle.zip");
+                let dst = copy_to_dir_unique(&src, &export_dir, file_name)?;
+                let dst_s = dst.to_string_lossy().to_string();
+                items[0].exported_bundle_path = Some(dst_s.clone());
+                merged_bundle_path = Some(dst_s);
+            } else {
+                let file_name = build_batch_bundle_filename("export", &params.name);
+                let out = unique_path_in_dir(&export_dir, &file_name);
+
+                // Inner bundle zip files from vault.
+                let mut inner: Vec<(String, PathBuf)> = Vec::new();
+                for item in &items {
+                    let entry = format!("bundles/{}.zip", item.session_id);
+                    inner.push((entry, PathBuf::from(&item.vault_bundle_path)));
+                }
+
+                #[derive(Serialize)]
+                struct BatchManifestItem {
+                    session_id: String,
+                    inner_zip: String,
+                    resume_cmd: String,
+                }
+
+                #[derive(Serialize)]
+                struct BatchManifest {
+                    schema_version: u32,
+                    kind: String,
+                    name: String,
+                    note: Option<String>,
+                    created_at: String,
+                    items: Vec<BatchManifestItem>,
+                }
+
+                let created_at = bundle::now_rfc3339_utc()?;
+                let batch_manifest = BatchManifest {
+                    schema_version: 1,
+                    kind: "codexrelay_batch_export".to_string(),
+                    name: params.name.clone(),
+                    note: params.note.clone(),
+                    created_at,
+                    items: items
+                        .iter()
+                        .map(|it| BatchManifestItem {
+                            session_id: it.session_id.clone(),
+                            inner_zip: format!("bundles/{}.zip", it.session_id),
+                            resume_cmd: it.resume_cmd.clone(),
+                        })
+                        .collect(),
+                };
+                let json = serde_json::to_string_pretty(&batch_manifest)
+                    .map_err(|e| AppError::internal(format!("serialize batch manifest: {e}")))?;
+
+                bundle::write_batch_zip_of_zips(&out, &inner, Some(&json))?;
+                merged_bundle_path = Some(out.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    Ok(ExportSessionsResult {
+        mode: params.mode,
+        export_dir: export_dir.to_string_lossy().to_string(),
+        merged_bundle_path,
+        items,
+        errors,
     })
 }
 
@@ -589,6 +827,165 @@ pub fn import_bundle<R: tauri::Runtime>(
             resume_cmd: Some(format!("codex resume {}", effective_session_id)),
             status: "ok".to_string(),
         })
+    })
+}
+
+pub fn import_bundles<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    params: ImportBundlesParams,
+) -> AppResult<ImportBundlesResult> {
+    if params.name.trim().is_empty() {
+        return Err(AppError::validation("名称为必填项").with_hint("请填写本次导入/传递的名称。"));
+    }
+    if params.bundle_paths.is_empty() {
+        return Err(AppError::validation("请选择至少一个 zip 包")
+            .with_hint("你可以多选 zip 文件，或选择“合并后的一个压缩包”。"));
+    }
+
+    // Dedupe while preserving order.
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut paths: Vec<String> = Vec::new();
+    for p in &params.bundle_paths {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if seen.insert(p.to_string()) {
+            paths.push(p.to_string());
+        }
+    }
+    if paths.is_empty() {
+        return Err(AppError::validation("bundle 路径为空").with_hint("请重新选择 zip 文件。"));
+    }
+
+    let mut out_items: Vec<ImportBundlesItem> = Vec::new();
+    let mut out_errors: Vec<ImportBundlesError> = Vec::new();
+
+    for p in &paths {
+        let src = PathBuf::from(p);
+        if !src.exists() {
+            out_errors.push(ImportBundlesError {
+                source: p.clone(),
+                message: "文件不存在".to_string(),
+            });
+            continue;
+        }
+
+        match classify_zip_bundle(&src) {
+            Ok(ZipBundleKind::SingleBundle) => {
+                // Best-effort: include short id in name when importing multiple sessions.
+                let sid = read_manifest_session_id(&src).unwrap_or_else(|_| "".to_string());
+                let derived_name = if paths.len() > 1 && !sid.is_empty() {
+                    format!("{} [{}]", params.name, &sid.chars().take(8).collect::<String>())
+                } else {
+                    params.name.clone()
+                };
+                match import_bundle(
+                    app,
+                    ImportParams {
+                        bundle_path: p.clone(),
+                        name: derived_name,
+                        note: params.note.clone(),
+                        strategy: params.strategy.clone(),
+                    },
+                ) {
+                    Ok(r) => out_items.push(ImportBundlesItem {
+                        source: p.clone(),
+                        result: r,
+                    }),
+                    Err(e) => out_errors.push(ImportBundlesError {
+                        source: p.clone(),
+                        message: format!(
+                            "{}{}",
+                            e.message,
+                            e.hint.map(|h| format!("（{}）", h)).unwrap_or_default()
+                        ),
+                    }),
+                }
+            }
+            Ok(ZipBundleKind::BatchZip { entries }) => {
+                if entries.is_empty() {
+                    out_errors.push(ImportBundlesError {
+                        source: p.clone(),
+                        message: "合并包中未找到可导入的 .zip 条目".to_string(),
+                    });
+                    continue;
+                }
+
+                let tmp_root = crate::app_paths::app_data_dir(app)
+                    .map_err(AppError::from)?
+                    .join("tmp_batch_import")
+                    .join(uuid::Uuid::now_v7().to_string());
+                fs::create_dir_all(&tmp_root).map_err(|e| {
+                    AppError::io(format!("create tmp_batch_import dir: {e}"))
+                })?;
+
+                for (idx, entry_name) in entries.iter().enumerate() {
+                    let tmp_zip = tmp_root.join(format!("inner-{idx}.zip"));
+                    if let Err(e) = extract_zip_entry_to_file(&src, entry_name, &tmp_zip) {
+                        out_errors.push(ImportBundlesError {
+                            source: format!("{p}::{entry_name}"),
+                            message: e,
+                        });
+                        continue;
+                    }
+
+                    let sid = read_manifest_session_id(&tmp_zip).unwrap_or_else(|_| "".to_string());
+                    let derived_name = if !sid.is_empty() {
+                        format!("{} [{}]", params.name, &sid.chars().take(8).collect::<String>())
+                    } else {
+                        params.name.clone()
+                    };
+
+                    match import_bundle(
+                        app,
+                        ImportParams {
+                            bundle_path: tmp_zip.to_string_lossy().to_string(),
+                            name: derived_name,
+                            note: params.note.clone(),
+                            strategy: params.strategy.clone(),
+                        },
+                    ) {
+                        Ok(r) => out_items.push(ImportBundlesItem {
+                            source: format!("{p}::{entry_name}"),
+                            result: r,
+                        }),
+                        Err(e) => out_errors.push(ImportBundlesError {
+                            source: format!("{p}::{entry_name}"),
+                            message: format!(
+                                "{}{}",
+                                e.message,
+                                e.hint.map(|h| format!("（{}）", h)).unwrap_or_default()
+                            ),
+                        }),
+                    }
+                }
+
+                // Best-effort cleanup.
+                let _ = vault::safe_remove_dir(&tmp_root);
+            }
+            Ok(ZipBundleKind::Unknown) => {
+                out_errors.push(ImportBundlesError {
+                    source: p.clone(),
+                    message: "不是有效的 CodexRelay 导出包：缺少 manifest.json/rollout.jsonl，且未找到 bundles/*.zip"
+                        .to_string(),
+                });
+            }
+            Err(e) => out_errors.push(ImportBundlesError {
+                source: p.clone(),
+                message: e.message,
+            }),
+        }
+    }
+
+    let imported = out_items.len();
+    let failed = out_errors.len();
+    Ok(ImportBundlesResult {
+        requested_paths: paths.len(),
+        imported,
+        failed,
+        items: out_items,
+        errors: out_errors,
     })
 }
 
@@ -1036,6 +1433,29 @@ fn build_bundle_filename(op: &str, session_id: &str, name: &str) -> String {
     file
 }
 
+fn build_batch_bundle_filename(op: &str, name: &str) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    let year = now.year();
+    let month = u8::from(now.month());
+    let day = now.day();
+    let hour = now.hour();
+    let minute = now.minute();
+    let second = now.second();
+    let ts = format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}Z");
+
+    let safe_name = sanitize_filename_component(name, 80);
+    let mut file = format!("CodexRelay-{op}-batch-{ts}-{safe_name}.zip");
+
+    const MAX_CHARS: usize = 180;
+    if file.chars().count() > MAX_CHARS {
+        let extra = file.chars().count().saturating_sub(MAX_CHARS);
+        let target_len = safe_name.chars().count().saturating_sub(extra + 3);
+        let safe_name = safe_name.chars().take(target_len.max(8)).collect::<String>();
+        file = format!("CodexRelay-{op}-batch-{ts}-{safe_name}.zip");
+    }
+    file
+}
+
 fn sanitize_filename_component(input: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (count, c) in input.trim().chars().enumerate() {
@@ -1062,6 +1482,142 @@ fn sanitize_filename_component(input: &str, max_chars: usize) -> String {
     } else {
         trimmed
     }
+}
+
+fn unique_path_in_dir(dir: &Path, file_name: &str) -> PathBuf {
+    let mut candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let p = Path::new(file_name);
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("CodexRelay");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+    for i in 2..=9999 {
+        let name = if ext.is_empty() {
+            format!("{stem}-{i}")
+        } else {
+            format!("{stem}-{i}.{ext}")
+        };
+        candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Should never happen, but still return something.
+    dir.join(format!("{stem}-{}.zip", uuid::Uuid::now_v7()))
+}
+
+fn copy_to_dir_unique(src: &Path, dst_dir: &Path, file_name: &str) -> AppResult<PathBuf> {
+    let dst = unique_path_in_dir(dst_dir, file_name);
+    vault::copy_file(src, &dst)?;
+    Ok(dst)
+}
+
+#[derive(Debug, Clone)]
+enum ZipBundleKind {
+    SingleBundle,
+    BatchZip { entries: Vec<String> },
+    Unknown,
+}
+
+fn classify_zip_bundle(zip_path: &Path) -> AppResult<ZipBundleKind> {
+    let f =
+        fs::File::open(zip_path).map_err(|e| AppError::io(format!("open zip: {e}")))?;
+    let mut z =
+        zip::ZipArchive::new(f).map_err(|e| AppError::io(format!("read zip: {e}")))?;
+
+    let has_manifest = z.by_name("manifest.json").is_ok();
+    let has_rollout = z.by_name("rollout.jsonl").is_ok();
+    if has_manifest && has_rollout {
+        return Ok(ZipBundleKind::SingleBundle);
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut any_zip_entries: Vec<String> = Vec::new();
+    for i in 0..z.len() {
+        let file = z
+            .by_index(i)
+            .map_err(|e| AppError::io(format!("read zip entry: {e}")))?;
+        let name = file.name().to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".zip") {
+            any_zip_entries.push(name.clone());
+        }
+        if lower.starts_with("bundles/") && lower.ends_with(".zip") {
+            entries.push(name);
+        }
+    }
+    if !entries.is_empty() {
+        return Ok(ZipBundleKind::BatchZip { entries });
+    }
+
+    // Fallback: user may have zipped multiple CodexRelay export zips manually at the root.
+    if !any_zip_entries.is_empty() {
+        return Ok(ZipBundleKind::BatchZip {
+            entries: any_zip_entries,
+        });
+    }
+
+    Ok(ZipBundleKind::Unknown)
+}
+
+fn extract_zip_entry_to_file(zip_path: &Path, entry_name: &str, out_path: &Path) -> Result<(), String> {
+    const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let f = fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
+    let mut z = zip::ZipArchive::new(f).map_err(|e| format!("read zip: {e}"))?;
+    let mut entry = z
+        .by_name(entry_name)
+        .map_err(|e| format!("read zip entry {entry_name}: {e}"))?;
+    let declared = entry.size();
+    if declared > MAX_BYTES {
+        return Err(format!(
+            "合并包条目过大：{}（{} bytes，超过上限 {} bytes）",
+            entry_name, declared, MAX_BYTES
+        ));
+    }
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create tmp dir: {e}"))?;
+    }
+    let mut out = fs::File::create(out_path).map_err(|e| format!("create tmp zip: {e}"))?;
+    let mut buf = [0u8; 1024 * 64];
+    let mut total: u64 = 0;
+    loop {
+        let n = entry.read(&mut buf).map_err(|e| format!("read entry: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > MAX_BYTES {
+            return Err("合并包条目内容超过上限（可能是损坏或恶意压缩包）".to_string());
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("write tmp zip: {e}"))?;
+    }
+    out.flush().map_err(|e| format!("flush tmp zip: {e}"))?;
+    Ok(())
+}
+
+fn read_manifest_session_id(zip_path: &Path) -> Result<String, String> {
+    let f = fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
+    let mut z = zip::ZipArchive::new(f).map_err(|e| format!("read zip: {e}"))?;
+    let mut file = z
+        .by_name("manifest.json")
+        .map_err(|e| format!("read manifest.json: {e}"))?;
+    const MAX_BYTES: u64 = 1024 * 1024;
+    if file.size() > MAX_BYTES {
+        return Err("manifest.json 过大".to_string());
+    }
+    let mut s = String::new();
+    file.read_to_string(&mut s)
+        .map_err(|e| format!("read manifest.json: {e}"))?;
+    let m: BundleManifest = serde_json::from_str(&s).map_err(|e| format!("parse manifest: {e}"))?;
+    Ok(m.session_id)
 }
 
 fn rewrite_session_id(src: &Path, old_id: &str, new_id: &str, dst: &Path) -> Result<(), String> {

@@ -90,6 +90,50 @@ pub fn write_bundle_zip(
     Ok(())
 }
 
+pub fn write_batch_zip_of_zips(
+    zip_path: &Path,
+    inner_zips: &[(String, PathBuf)],
+    batch_manifest_json: Option<&str>,
+) -> Result<(), String> {
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create zip dir: {e}"))?;
+    }
+
+    let f = fs::File::create(zip_path).map_err(|e| format!("create zip: {e}"))?;
+    let mut w = zip::ZipWriter::new(f);
+
+    // Inner zip files are already compressed; store them to avoid wasting CPU and time.
+    let stored = FileOptions::default().compression_method(CompressionMethod::Stored);
+    for (entry_name, src_zip) in inner_zips {
+        w.start_file(entry_name, stored)
+            .map_err(|e| format!("zip start_file {entry_name}: {e}"))?;
+        let mut f =
+            fs::File::open(src_zip).map_err(|e| format!("open inner zip {entry_name}: {e}"))?;
+        let mut buf = [0u8; 1024 * 64];
+        loop {
+            let n = f
+                .read(&mut buf)
+                .map_err(|e| format!("read inner zip {entry_name}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n])
+                .map_err(|e| format!("write zip entry {entry_name}: {e}"))?;
+        }
+    }
+
+    if let Some(json) = batch_manifest_json {
+        let opts = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        w.start_file("batch_manifest.json", opts)
+            .map_err(|e| format!("zip start_file batch_manifest.json: {e}"))?;
+        w.write_all(json.as_bytes())
+            .map_err(|e| format!("write batch_manifest.json: {e}"))?;
+    }
+
+    w.finish().map_err(|e| format!("finalize zip: {e}"))?;
+    Ok(())
+}
+
 fn write_zip_file(
     w: &mut zip::ZipWriter<fs::File>,
     name: &str,

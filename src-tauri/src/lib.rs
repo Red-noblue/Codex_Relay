@@ -73,6 +73,16 @@ async fn export_bundle(
 }
 
 #[tauri::command]
+async fn export_sessions(
+    app: tauri::AppHandle,
+    params: ops::ExportSessionsParams,
+) -> AppResult<ops::ExportSessionsResult> {
+    tauri::async_runtime::spawn_blocking(move || ops::export_sessions(&app, params))
+        .await
+        .map_err(|e| AppError::internal(format!("export-sessions task join error: {e}")))?
+}
+
+#[tauri::command]
 async fn inspect_bundle(
     app: tauri::AppHandle,
     bundle_path: String,
@@ -90,6 +100,16 @@ async fn import_bundle(
     tauri::async_runtime::spawn_blocking(move || ops::import_bundle(&app, params))
         .await
         .map_err(|e| AppError::internal(format!("import task join error: {e}")))?
+}
+
+#[tauri::command]
+async fn import_bundles(
+    app: tauri::AppHandle,
+    params: ops::ImportBundlesParams,
+) -> AppResult<ops::ImportBundlesResult> {
+    tauri::async_runtime::spawn_blocking(move || ops::import_bundles(&app, params))
+        .await
+        .map_err(|e| AppError::internal(format!("import-bundles task join error: {e}")))?
 }
 
 #[tauri::command]
@@ -363,8 +383,10 @@ pub fn run() {
             app_status,
             codex_list_sessions,
             export_bundle,
+            export_sessions,
             inspect_bundle,
             import_bundle,
+            import_bundles,
             change_session_id,
             restore_from_history,
             settings_set_codex_home_override,

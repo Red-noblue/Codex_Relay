@@ -7,8 +7,12 @@ import type {
   ExtractSessionIdsResult,
   ExportParams,
   ExportResult,
+  ExportSessionsParams,
+  ExportSessionsResult,
   ImportParams,
   ImportResult,
+  ImportBundlesParams,
+  ImportBundlesResult,
   InspectBundleResult,
   HistoryLatestForSessionsParams,
   HistoryUpdateParams,
@@ -42,6 +46,12 @@ export async function exportBundle(params: ExportParams): Promise<ExportResult> 
   return invoke<ExportResult>("export_bundle", { params });
 }
 
+export async function exportSessions(
+  params: ExportSessionsParams,
+): Promise<ExportSessionsResult> {
+  return invoke<ExportSessionsResult>("export_sessions", { params });
+}
+
 export async function inspectBundle(
   bundle_path: string,
 ): Promise<InspectBundleResult> {
@@ -50,6 +60,12 @@ export async function inspectBundle(
 
 export async function importBundle(params: ImportParams): Promise<ImportResult> {
   return invoke<ImportResult>("import_bundle", { params });
+}
+
+export async function importBundles(
+  params: ImportBundlesParams,
+): Promise<ImportBundlesResult> {
+  return invoke<ImportBundlesResult>("import_bundles", { params });
 }
 
 export async function changeSessionId(

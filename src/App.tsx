@@ -19,9 +19,11 @@ import type {
   AppStatus,
   ChangeIdResult,
   ConflictStrategy,
-  ExportResult,
+  ExportBundleMode,
+  ExportSessionsResult,
   HistoryUpdateParams,
   ImportResult,
+  ImportBundlesResult,
   InspectBundleResult,
   RolloutPreview,
   SessionSummary,
@@ -265,17 +267,17 @@ function App() {
   const [exportName, setExportName] = useState("");
   const [exportNote, setExportNote] = useState("");
   const [exportIncludeShell, setExportIncludeShell] = useState(false);
-  const [exportResults, setExportResults] = useState<ExportResult[]>([]);
-  const [exportErrors, setExportErrors] = useState<
-    Array<{ session_id: string; error: string }>
-  >([]);
+  const [exportMode, setExportMode] = useState<ExportBundleMode>("merged");
+  const [exportBatchResult, setExportBatchResult] =
+    useState<ExportSessionsResult | null>(null);
   const [exportIdsExtractBusy, setExportIdsExtractBusy] = useState(false);
   const [exportIdsExtractInfo, setExportIdsExtractInfo] = useState<string | null>(
     null,
   );
 
   // Import UI
-  const [importBundlePath, setImportBundlePath] = useState<string>("");
+  const [importBundlePaths, setImportBundlePaths] = useState<string[]>([]);
+  const [importPickInfo, setImportPickInfo] = useState<string | null>(null);
   const [inspectResult, setInspectResult] = useState<InspectBundleResult | null>(
     null,
   );
@@ -283,7 +285,8 @@ function App() {
   const [importNote, setImportNote] = useState("");
   const [importStrategy, setImportStrategy] =
     useState<ConflictStrategy>("overwrite");
-  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [importBatchResult, setImportBatchResult] =
+    useState<ImportBundlesResult | null>(null);
   const [bundlePreview, setBundlePreview] = useState<RolloutPreview | null>(
     null,
   );
@@ -828,9 +831,9 @@ function App() {
 
   async function inspectImportBundleFromPath(path: string) {
     setError(null);
-    setImportResult(null);
+    setImportBatchResult(null);
     setInspectResult(null);
-    setImportBundlePath(path);
+    setImportPickInfo(null);
     setBusyAction("inspect");
     try {
       if (!isTauri) {
@@ -847,26 +850,43 @@ function App() {
         inspected.local_existing.sha256 !== inspected.manifest.rollout.sha256;
       setImportStrategy(hasConflict ? "import_as_new" : "overwrite");
     } catch (e) {
-      setError(toErrorMessage(e));
+      // 合并包（外层 zip）不一定包含 manifest.json/rollout.jsonl，检查会失败；
+      // 这种情况下用户仍可以直接“导入”。
+      setInspectResult(null);
+      setImportPickInfo(
+        `检查失败：${toErrorMessage(e)}\n提示：如果这是合并导出包，可以直接点击“导入”批量导入。`,
+      );
     } finally {
       setBusyAction(null);
     }
   }
 
-  async function handlePickImportBundle() {
+  async function handlePickImportBundles() {
     try {
       if (!isTauri) {
         setError("网页预览模式不支持选择文件，请在桌面版（Tauri）中使用。");
         return;
       }
       const selected = await open({
-        title: "选择 bundle.zip",
-        multiple: false,
+        title: "选择 zip（可多选）",
+        multiple: true,
         filters: [{ name: "导出包 (zip)", extensions: ["zip"] }],
       });
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      if (!path) return;
-      await inspectImportBundleFromPath(path);
+      const paths = Array.isArray(selected)
+        ? selected
+        : selected
+          ? [selected]
+          : [];
+      if (!paths.length) return;
+      setError(null);
+      setImportPickInfo(`已选择 ${paths.length} 个 zip。`);
+      setImportBatchResult(null);
+      setInspectResult(null);
+      setImportBundlePaths(paths);
+      // Best-effort inspect when selecting a single file.
+      if (paths.length === 1) {
+        await inspectImportBundleFromPath(paths[0]);
+      }
     } catch (e) {
       setError(toErrorMessage(e));
     }
@@ -917,9 +937,9 @@ function App() {
       setError("网页预览模式不支持拖拽导入，请在桌面版（Tauri）中使用。");
       return;
     }
-    const zip = paths.find((p) => p.toLowerCase().endsWith(".zip"));
-    if (!zip) {
-      setError("只支持拖入 bundle.zip 文件。");
+    const zips = paths.filter((p) => p.toLowerCase().endsWith(".zip"));
+    if (!zips.length) {
+      setError("只支持拖入 zip 文件。");
       return;
     }
     if (busyRef.current) {
@@ -927,13 +947,19 @@ function App() {
       return;
     }
     setTab("import");
-    await inspectImportBundleFromPath(zip);
+    setError(null);
+    setImportPickInfo(`已选择 ${zips.length} 个 zip。`);
+    setImportBatchResult(null);
+    setInspectResult(null);
+    setImportBundlePaths(zips);
+    if (zips.length === 1) {
+      await inspectImportBundleFromPath(zips[0]);
+    }
   }
 
   async function handleExport() {
     setError(null);
-    setExportResults([]);
-    setExportErrors([]);
+    setExportBatchResult(null);
     setBusyAction("export");
     try {
       if (!isTauri) {
@@ -951,32 +977,19 @@ function App() {
         return;
       }
       const note = exportNote.trim() ? exportNote.trim() : null;
-
-      const results: ExportResult[] = [];
-      const errors: Array<{ session_id: string; error: string }> = [];
-      for (const sid of ids) {
-        const name =
-          ids.length === 1 ? baseName : `${baseName} [${sid.slice(0, 8)}]`;
-        try {
-          const r = await api.exportBundle({
-            session_id: sid,
-            name,
-            note,
-            include_shell_snapshot: exportIncludeShell,
-          });
-          results.push(r);
-        } catch (e) {
-          errors.push({ session_id: sid, error: toErrorMessage(e) });
-        }
-      }
-
-      setExportResults(results);
-      setExportErrors(errors);
-      if (results.length) {
+      const r = await api.exportSessions({
+        session_ids: ids,
+        name: baseName,
+        note,
+        include_shell_snapshot: exportIncludeShell,
+        mode: exportMode,
+      });
+      setExportBatchResult(r);
+      if (r.items.length) {
         await refreshHistory();
       }
-      if (errors.length) {
-        setError(`部分导出失败：${errors.length}/${ids.length}（详见导出结果）。`);
+      if (r.errors.length) {
+        setError(`部分导出失败：${r.errors.length}/${ids.length}（详见导出结果）。`);
       }
     } catch (e) {
       setError(toErrorMessage(e));
@@ -986,24 +999,34 @@ function App() {
   }
 
   async function handleImport() {
-    if (!inspectResult) return;
     setError(null);
-    setImportResult(null);
+    setImportBatchResult(null);
     setBusyAction("import");
     try {
       if (!isTauri) {
         setError("网页预览模式不支持导入，请在桌面版（Tauri）中使用。");
         return;
       }
-      const r = await api.importBundle({
-        bundle_path: importBundlePath,
+      if (importBundlePaths.length === 0) {
+        setError("请选择至少一个 zip 文件。");
+        return;
+      }
+      if (!importName.trim()) {
+        setError("名称为必填项。");
+        return;
+      }
+      const r = await api.importBundles({
+        bundle_paths: importBundlePaths,
         name: importName.trim(),
         note: importNote.trim() ? importNote.trim() : null,
         strategy: importStrategy,
       });
-      setImportResult(r);
+      setImportBatchResult(r);
       await refreshStatusAndSessions();
       await refreshHistory();
+      if (r.failed) {
+        setError(`部分导入失败：${r.failed}（详见导入结果）。`);
+      }
     } catch (e) {
       setError(toErrorMessage(e));
     } finally {
@@ -1714,6 +1737,20 @@ function App() {
 	                placeholder="可选"
 	              />
 	            </label>
+	            <label className="field">
+	              <div className="label">导出包数量</div>
+	              <select
+	                value={exportMode}
+	                onChange={(e) => setExportMode(e.target.value as ExportBundleMode)}
+	                disabled={!isTauri}
+	              >
+	                <option value="merged">合并为一个 zip（默认，推荐）</option>
+	                <option value="per_session">每个会话单独一个 zip</option>
+	              </select>
+	              <div className="hint muted">
+	                默认导出到系统下载目录（Downloads）。
+	              </div>
+	            </label>
             <label className="field checkbox">
               <input
                 type="checkbox"
@@ -1737,31 +1774,64 @@ function App() {
 		              {busyAction === "export"
 		                ? "导出中..."
 		                : exportSessionIds.length > 1
-		                  ? "批量生成导出包"
+		                  ? exportMode === "merged"
+		                    ? "生成合并导出包"
+		                    : "生成多个导出包"
 		                  : "生成导出包"}
 		            </button>
 		          </div>
 	
-	          {exportResults.length || exportErrors.length ? (
+	          {exportBatchResult ? (
 	            <div className="result">
 	              <h3>导出结果</h3>
-	              {exportErrors.length ? (
+	              <div className="kv">
+	                <div>输出目录</div>
+	                <div className="mono">{exportBatchResult.export_dir}</div>
+	                <div>模式</div>
+	                <div>
+	                  {exportBatchResult.mode === "merged"
+	                    ? "合并为一个 zip"
+	                    : "每个会话单独 zip"}
+	                </div>
+	                {exportBatchResult.merged_bundle_path ? (
+	                  <>
+	                    <div>导出包</div>
+	                    <div className="mono">{exportBatchResult.merged_bundle_path}</div>
+	                  </>
+	                ) : null}
+	              </div>
+	              {exportBatchResult.merged_bundle_path ? (
+	                <div className="row">
+	                  <button
+	                    type="button"
+	                    onClick={() => handleReveal(exportBatchResult.merged_bundle_path!)}
+	                  >
+	                    显示导出包
+	                  </button>
+	                </div>
+	              ) : null}
+	              {exportBatchResult.errors.length ? (
 	                <div className="error">
 	                  <div>以下会话导出失败：</div>
 	                  <pre className="mono small">
-	                    {exportErrors
-	                      .map((e) => `${e.session_id}: ${e.error}`)
+	                    {exportBatchResult.errors
+	                      .map((e) => `${e.session_id}: ${e.message}`)
 	                      .join("\n")}
 	                  </pre>
 	                </div>
 	              ) : null}
-	              {exportResults.map((r) => (
+	              {exportBatchResult.items.map((r) => (
 	                <div className="resultBlock" key={r.transfer_id}>
 	                  <div className="kv">
 	                    <div>会话ID</div>
-	                    <div className="mono">{r.manifest.session_id}</div>
+	                    <div className="mono">{r.session_id}</div>
 	                    <div>导出包</div>
-	                    <div className="mono">{r.bundle_path}</div>
+	                    <div className="mono">
+	                      {r.exported_bundle_path ??
+	                        (exportBatchResult.merged_bundle_path
+	                          ? "（已合并到单个 zip）"
+	                          : r.vault_bundle_path)}
+	                    </div>
 	                    <div>存档库</div>
 	                    <div className="mono">{r.vault_dir}</div>
 	                    <div>SHA256</div>
@@ -1772,7 +1842,13 @@ function App() {
 	                  <div className="row">
 	                    <button
 	                      type="button"
-	                      onClick={() => handleReveal(r.bundle_path)}
+	                      onClick={() =>
+	                        handleReveal(
+	                          r.exported_bundle_path ??
+	                            exportBatchResult.merged_bundle_path ??
+	                            r.vault_bundle_path,
+	                        )
+	                      }
 	                    >
 	                      显示导出包
 	                    </button>
@@ -1802,22 +1878,30 @@ function App() {
 	          <div className="row">
 	            <button
 	              type="button"
-	              onClick={handlePickImportBundle}
+	              onClick={handlePickImportBundles}
 	              disabled={!isTauri || busy}
 	            >
-	              {busyAction === "inspect" ? "检查中..." : "选择 bundle.zip"}
+	              {busyAction === "inspect" ? "检查中..." : "选择 zip（可多选）"}
 	            </button>
-	            {importBundlePath ? (
-	              <span className="mono small truncatePath" title={importBundlePath}>
-	                {importBundlePath}
+	            {importBundlePaths.length ? (
+	              <span
+	                className="mono small truncatePath"
+	                title={importBundlePaths.join("\n")}
+	              >
+	                {importBundlePaths.length === 1
+	                  ? importBundlePaths[0]
+	                  : `已选择 ${importBundlePaths.length} 个 zip`}
 	              </span>
 	            ) : null}
 	          </div>
 	          <div className="hint muted small">
 	            {isTauri
-	              ? "也可以直接把 bundle.zip 拖进窗口。"
+	              ? "也可以直接把 zip 文件拖进窗口（支持多选/合并包）。"
 	              : "提示：拖拽/选择文件仅桌面版（Tauri）可用。"}
 	          </div>
+	          {importPickInfo ? (
+	            <div className="previewWarn">{importPickInfo}</div>
+	          ) : null}
 
 	          {inspectResult ? (
             <div className="result">
@@ -2223,14 +2307,25 @@ function App() {
 				                </>
 				              )}
 
-		              <h3>导入选项</h3>
-		              <div className="grid">
-		                <label className="field">
-		                  <div className="label">名称（必填）</div>
+		              <div className="hint muted small">
+		                （已完成检查）导入选项在下方设置。
+		              </div>
+	            </div>
+	          ) : null}
+
+	          {importBundlePaths.length ? (
+	            <div className="result">
+	              <h3>导入选项</h3>
+	              <div className="grid">
+	                <label className="field">
+	                  <div className="label">名称（必填）</div>
 	                  <input
 	                    value={importName}
 	                    onChange={(e) => setImportName(e.target.value)}
 	                  />
+	                  <div className="hint muted small">
+	                    批量导入时会自动在名称后追加短ID（便于历史记录区分）。
+	                  </div>
 	                </label>
 	                <label className="field">
 	                  <div className="label">备注</div>
@@ -2239,68 +2334,63 @@ function App() {
 	                    onChange={(e) => setImportNote(e.target.value)}
 	                  />
 	                </label>
-		                {inspectHasConflict ? (
-		                  <div className="field">
-		                    <div className="label">处理方式</div>
-		                    <div className="radioGroup">
-		                      <label className="radio">
-		                        <input
-		                          type="radio"
-		                          name="import_strategy"
-		                          checked={importStrategy === "import_as_new"}
-		                          onChange={() => setImportStrategy("import_as_new")}
-		                        />
-		                        <span>改ID导入（推荐，保留分叉）</span>
-		                      </label>
-		                      <label className="radio">
-		                        <input
-		                          type="radio"
-		                          name="import_strategy"
-		                          checked={importStrategy === "overwrite"}
-		                          onChange={() => setImportStrategy("overwrite")}
-		                        />
-		                        <span>覆盖本机（会自动备份本机版本到存档库）</span>
-		                      </label>
-		                      <label className="radio">
-		                        <input
-		                          type="radio"
-		                          name="import_strategy"
-		                          checked={importStrategy === "cancel"}
-		                          onChange={() => setImportStrategy("cancel")}
-		                        />
-		                        <span>取消（仅存档，不写入 CODEX_HOME）</span>
-		                      </label>
-		                    </div>
-		                  </div>
-		                ) : (
-		                  <label className="field">
-		                    <div className="label">导入方式</div>
-		                    <select
-		                      value={importStrategy}
-		                      onChange={(e) =>
-		                        setImportStrategy(e.target.value as ConflictStrategy)
-		                      }
-		                    >
-		                      <option value="overwrite">覆盖本机 / 写入原位置</option>
-		                      <option value="import_as_new">改ID导入（新会话）</option>
-		                      <option value="cancel">取消</option>
-		                    </select>
-		                    <div className="hint muted">
-		                      默认：<span className="mono">覆盖本机</span>
-		                    </div>
-		                  </label>
-		                )}
-		              </div>
+	                {inspectHasConflict ? (
+	                  <div className="field">
+	                    <div className="label">处理方式</div>
+	                    <div className="radioGroup">
+	                      <label className="radio">
+	                        <input
+	                          type="radio"
+	                          name="import_strategy"
+	                          checked={importStrategy === "import_as_new"}
+	                          onChange={() => setImportStrategy("import_as_new")}
+	                        />
+	                        <span>改ID导入（推荐，保留分叉）</span>
+	                      </label>
+	                      <label className="radio">
+	                        <input
+	                          type="radio"
+	                          name="import_strategy"
+	                          checked={importStrategy === "overwrite"}
+	                          onChange={() => setImportStrategy("overwrite")}
+	                        />
+	                        <span>覆盖本机（会自动备份本机版本到存档库）</span>
+	                      </label>
+	                      <label className="radio">
+	                        <input
+	                          type="radio"
+	                          name="import_strategy"
+	                          checked={importStrategy === "cancel"}
+	                          onChange={() => setImportStrategy("cancel")}
+	                        />
+	                        <span>取消（仅存档，不写入 CODEX_HOME）</span>
+	                      </label>
+	                    </div>
+	                  </div>
+	                ) : (
+	                  <label className="field">
+	                    <div className="label">导入方式</div>
+	                    <select
+	                      value={importStrategy}
+	                      onChange={(e) =>
+	                        setImportStrategy(e.target.value as ConflictStrategy)
+	                      }
+	                    >
+	                      <option value="recommended">推荐（有冲突则改ID）</option>
+	                      <option value="overwrite">覆盖本机 / 写入原位置</option>
+	                      <option value="import_as_new">改ID导入（新会话）</option>
+	                      <option value="cancel">取消</option>
+	                    </select>
+	                    <div className="hint muted">
+	                      默认：<span className="mono">覆盖本机</span>
+	                    </div>
+	                  </label>
+	                )}
+	              </div>
 	              <div className="row">
 	                <button
-                  type="button"
-                  disabled={
-                    !isTauri ||
-                    busy ||
-                    !inspectResult.sha256_ok ||
-                    !importName.trim() ||
-                    !importBundlePath
-	                  }
+	                  type="button"
+	                  disabled={!isTauri || busy || !importName.trim()}
 	                  onClick={handleImport}
 	                >
 	                  {busyAction === "import" ? "导入中..." : "导入"}
@@ -2309,47 +2399,82 @@ function App() {
 	            </div>
 	          ) : null}
 
-	          {importResult ? (
+	          {importBatchResult ? (
 	            <div className="result">
 	              <h3>导入结果</h3>
 	              <div className="kv">
-                <div>状态</div>
-                <div>
-                  <span className="pill">{statusZh(importResult.status)}</span>
-                </div>
-	                <div>实际会话ID</div>
-	                <div className="mono">{importResult.effective_session_id}</div>
-	                <div>恢复命令</div>
-	                <div className="mono">{importResult.resume_cmd ?? "-"}</div>
-	                <div>本机文件</div>
-	                <div className="mono">{importResult.local_rollout_path ?? "-"}</div>
-	                <div>存档库</div>
-	                <div className="mono">{importResult.vault_dir}</div>
+	                <div>选择的 zip</div>
+	                <div>{importBatchResult.requested_paths}</div>
+	                <div>导入成功</div>
+	                <div>{importBatchResult.imported}</div>
+	                <div>导入失败</div>
+	                <div>{importBatchResult.failed}</div>
 	              </div>
-	              <div className="row">
-                {importResult.local_rollout_path ? (
-                  <button
-	                    type="button"
-	                    onClick={() => handleReveal(importResult.local_rollout_path!)}
-	                  >
-	                    显示本机文件
-	                  </button>
-	                ) : null}
-	                {importResult.resume_cmd ? (
-	                  <button
-	                    type="button"
-	                    onClick={() => handleCopy(importResult.resume_cmd!)}
-	                  >
-	                    复制恢复命令
-	                  </button>
-	                ) : null}
-	                <button
-	                  type="button"
-	                  onClick={() => handleOpen(importResult.vault_dir)}
+	              {importBatchResult.errors.length ? (
+	                <div className="error">
+	                  <div>以下条目导入失败：</div>
+	                  <pre className="mono small">
+	                    {importBatchResult.errors
+	                      .map((e) => `${e.source}: ${e.message}`)
+	                      .join("\n")}
+	                  </pre>
+	                </div>
+	              ) : null}
+	              {importBatchResult.items.map((it, idx) => (
+	                <div
+	                  className="resultBlock"
+	                  key={`${it.result.transfer_id}-${idx}`}
 	                >
-	                  打开存档库
-	                </button>
-	              </div>
+	                  <div className="kv">
+	                    <div>来源</div>
+	                    <div className="mono small truncatePath" title={it.source}>
+	                      {it.source}
+	                    </div>
+	                    <div>状态</div>
+	                    <div>
+	                      <span className="pill">
+	                        {statusZh(it.result.status)}
+	                      </span>
+	                    </div>
+	                    <div>实际会话ID</div>
+	                    <div className="mono">{it.result.effective_session_id}</div>
+	                    <div>恢复命令</div>
+	                    <div className="mono">{it.result.resume_cmd ?? "-"}</div>
+	                    <div>本机文件</div>
+	                    <div className="mono">
+	                      {it.result.local_rollout_path ?? "-"}
+	                    </div>
+	                    <div>存档库</div>
+	                    <div className="mono">{it.result.vault_dir}</div>
+	                  </div>
+	                  <div className="row">
+	                    {it.result.local_rollout_path ? (
+	                      <button
+	                        type="button"
+	                        onClick={() =>
+	                          handleReveal(it.result.local_rollout_path!)
+	                        }
+	                      >
+	                        显示本机文件
+	                      </button>
+	                    ) : null}
+	                    {it.result.resume_cmd ? (
+	                      <button
+	                        type="button"
+	                        onClick={() => handleCopy(it.result.resume_cmd!)}
+	                      >
+	                        复制恢复命令
+	                      </button>
+	                    ) : null}
+	                    <button
+	                      type="button"
+	                      onClick={() => handleOpen(it.result.vault_dir)}
+	                    >
+	                      打开存档库
+	                    </button>
+	                  </div>
+	                </div>
+	              ))}
 	            </div>
 	          ) : null}
 	        </section>

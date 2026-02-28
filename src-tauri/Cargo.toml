@@ -1,6 +1,6 @@
 [package]
 name = "codexrelay"
-version = "0.1.2"
+version = "0.1.3"
 description = "Cross-device Codex CLI session transfer manager"
 authors = ["you"]
 edition = "2021"
@@ -30,6 +30,7 @@ hex = "0.4"
 uuid = { version = "1", features = ["serde", "v7", "fast-rng"] }
 zip = "0.6"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+dirs = "6"
 
 [dev-dependencies]
 # Enable Tauri's mock runtime helpers for unit tests without affecting release builds.
