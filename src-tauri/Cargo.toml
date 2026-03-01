@@ -1,6 +1,6 @@
 [package]
 name = "codexrelay"
-version = "0.1.6"
+version = "0.1.7"
 description = "Cross-device Codex CLI session transfer manager"
 authors = ["you"]
 edition = "2021"
